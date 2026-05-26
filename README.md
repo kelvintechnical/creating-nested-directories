@@ -1,134 +1,178 @@
-# Lab 12: Creating Nested Directories — `mkdir -p`
+# Lab: Creating Nested Directories — `mkdir -p`
 
-**Series:** File Operations & Shell Fundamentals · **Lab 12 of the Novice → RHCA path**  
-**Certifications covered:** RHCSA EX200 (foundational), RHCE EX294 (every Ansible path reference), CKA (every kubelet/etcd/containerd path), RHCA building blocks (RH342 troubleshooting, RH358 services, RH236 storage)  
-**Prerequisite:** Labs 05–11  
-**Time Estimate:** 30–40 minutes  
-**Difficulty arc:** Tasks 1–6 foundation · 7–12 practical · 13–17 advanced · 18–20 exam-realistic
-
----
-
-## 🎯 Objective
-
-Build directory trees of any depth in one safe, idempotent command. By the end you will use `mkdir -p` so naturally that you never see "No such file or directory" again when prepping a path for a service, Ansible role, or kubelet manifest.
+**Series:** linux-ops-mastery — RHCSA Essential Tools & File Operations
+**Subjects covered:** `mkdir` for single-level creation, `-p` for create-all-missing-parents, `-m` for explicit mode on creation, `-v` for verbose output, `-Z` for SELinux context on creation, brace expansion `{a,b,c}` for batch creation, the umask interaction with `-m`, the idempotence of `mkdir -p` (rerunning is harmless), and the project-tree, multi-environment fixture-building patterns used in everyday Linux operations
+**Career arcs covered:** RHCSA ("create the directory `/data/X/Y/Z`" exam tasks), RHCE (Ansible `file: state=directory  recurse: yes`), SRE (deploy-time directory provisioning), DevOps (build artifact directory creation), AI/MLOps (experiment-run directory layout — `runs/2026/05/26/exp-1/`)
+**Prerequisite:** Labs 05–11 (navigation, listing, copy, move, delete)
+**Time Estimate:** 20 to 30 minutes
+**Difficulty arc:** Task 1 foundation (`mkdir`) · 2 `-p` recursive parents · 3 `-m` explicit mode · 4 brace expansion fan-out · 5 `-v` and `-Z` modifiers · 6 RHCSA exam-realistic capstone
 
 ---
 
-## 🧠 Concept: Directories Are Just Special Files
+## Objective
 
-In Linux, a directory is a file whose contents are a list of `name → inode` pairs. To create one, the kernel:
+Build directory trees in a single command — including missing parents, including specific permissions, including SELinux contexts where needed. By the end of this lab you can answer any "create the path `/data/year/month/day/exp-N/`" prompt with a single `mkdir -p` and you understand why that command is **idempotent** (safe to rerun) while bare `mkdir` is not.
 
-1. Allocates an inode (with type `d`).
-2. Initializes its content with two entries: `.` (self) and `..` (parent).
-3. Adds a new entry in the parent directory pointing to the new inode.
+The capstone is an exam-realistic prompt: *"Create the directory tree `/data/projects/{web,api,db}/{logs,configs,backups}` in one command, ensure each leaf directory is mode 0750 owned by `root:wheel`, and verify the SELinux context of one leaf matches `default_t` (or whatever your policy sets)."*
+
+> **Lab safety note:** All work happens in `/tmp/mk-lab` and `/data` (created fresh). No system file is modified.
+
+---
+
+## Concept: `mkdir` Makes Directories — One at a Time, Unless
+
+The bare `mkdir` syscall creates exactly **one** directory and refuses if the parent does not exist. That's by design — the kernel will not invent paths you did not request. Real-world workflows need "make this whole chain" semantics, which is what `-p` adds.
 
 ```
-mkdir /a/b/c
-   └── needs /a/b to already exist
-        └── if /a/b doesn't exist → "No such file or directory"
+   $ mkdir /a/b/c
+   mkdir: cannot create directory '/a/b/c': No such file or directory
+                 ↑
+                 └─ parent '/a/b' doesn't exist; kernel refuses
 
-mkdir -p /a/b/c
-   └── walks the path; creates each missing piece
-        └── never errors if /a, /a/b, or /a/b/c already exist
+   $ mkdir -p /a/b/c
+   (success — creates /a, then /a/b, then /a/b/c, all in one command)
 ```
 
-> **Why this matters on every cert:** RHCSA Task 8, CKA "rebuild `/etc/kubernetes/pki/etcd`," Ansible role scaffolding — every one of them creates nested paths. `mkdir -p` is the only safe way.
+> **Why this matters:** Every script that ensures a directory layout uses `mkdir -p`. It is **idempotent** — running it again is a no-op (no error). Plain `mkdir` errors on the second run, which breaks scripts in CI loops or on Ansible re-application.
 
-### The `mkdir -p` invariants
+---
 
-| Invariant | Meaning |
+## 📜 Why `mkdir -p` Exists — The Story
+
+In **Unix v1 (1971)** `mkdir` was a SUID helper because the `mkdir(2)` syscall did not yet exist — you had to construct directory entries by hand. The command's contract was "create one directory; error if the parent is missing." That contract is the same in 2026.
+
+The `-p` flag was added when scripts started needing deep trees. Building tarballs, installing packages, and bootstrapping new systems all required a way to say "ensure this chain exists; if any segment already exists, that's fine; if any segment is missing, create it." Before `-p`, that took a tiny shell loop:
+
+```bash
+# pre-`-p` style — verbose, error-prone
+for p in /a /a/b /a/b/c; do
+  [ -d "$p" ] || mkdir "$p"
+done
+```
+
+`-p` collapses the loop into one flag. It also turns `mkdir` into one of the few **idempotent** filesystem operations — rerunning it never errors, which is exactly what you want in Ansible, in `Makefile` rules, and in every "ensure this exists" startup sequence.
+
+> **The point of the story:** `mkdir -p` is not "mkdir with creation of parents." It is "mkdir made idempotent." That property is why every modern script uses it instead of bare `mkdir`.
+
+---
+
+## 👪 The mkdir Family — Who Lives There
+
+### `mkdir` flags
+
+| Flag | Meaning |
 |---|---|
-| **Idempotent** | Running twice produces the same result; second run is a no-op |
-| **Recursive** | Creates parents in one call |
-| **No error on existing** | "Already there" is success, not failure |
-| **Inherits umask** | Final permissions = `0777 & ~umask` (umask `0022` → `0755`) |
-| **Each intermediate dir** | Gets the same default permissions (`-m` only applies to the final or all if `-m -p`) |
+| (default) | Create one directory; error if parent missing or target exists |
+| `-p` / `--parents` | Create missing parents; no error if target exists |
+| `-m MODE` / `--mode=MODE` | Set explicit mode (overrides umask) |
+| `-v` / `--verbose` | Print each created directory |
+| `-Z` (modern coreutils) | Set SELinux context on creation |
+| `--context=CONTEXT` | Specific SELinux context |
+
+### Related directory helpers
+
+| Tool | Notes |
+|---|---|
+| `install -d -m MODE DIR` | Create with mode (and chown via -o/-g) |
+| `cp -a SRC DST` | Will create DST and parents as needed |
+| `find PATH -type d -mkdir` | (not a real flag — for completeness) |
+| Brace expansion `{a,b,c}` | Bash feature, not part of `mkdir`, but creates multiple targets in one command |
+
+> **The point of the family tree:** `mkdir -p` is the canonical "ensure this tree exists" tool. `install -d` is the "ensure this exists with explicit mode/owner" tool, common in Makefiles and rpm specs.
 
 ---
 
-## 📚 `mkdir` Reference
+## 🔬 The Anatomy of `mkdir -p` — In One Diagram
 
-| Flag | Long form | Purpose |
+```
+$ mkdir -p /data/projects/web/logs
+
+What the kernel does (one syscall per missing segment):
+  1. stat /data            → ENOENT → mkdir /data
+  2. stat /data/projects   → ENOENT → mkdir /data/projects
+  3. stat /data/projects/web → ENOENT → mkdir /data/projects/web
+  4. stat /data/projects/web/logs → ENOENT → mkdir /data/projects/web/logs
+
+What mkdir DOES NOT DO:
+  • does not error if any segment already exists (-p makes it idempotent)
+  • does not apply -m MODE retroactively to existing parents
+  • does not run any hooks or notify other processes
+  • does not preserve any special metadata from another path
+```
+
+> **Reading rule:** `-p` makes mkdir tolerant of two things — missing intermediate directories, and the final directory already existing. Either of those would have been an error with plain `mkdir`.
+
+---
+
+## 📚 mkdir Reference Table
+
+| Task | Command | Notes |
 |---|---|---|
-| (none) | — | Create a single directory; error if parent missing or it already exists |
-| `-p` | `--parents` | Create missing parents; do not error if any segment exists |
-| `-m MODE` | `--mode=MODE` | Set permission mode at creation (bypasses umask) |
-| `-v` | `--verbose` | Print each directory created |
-| `-Z` | `--context=CTX` | Set SELinux context at creation (or use system default if no CTX) |
-| `--context=CTX` | — | Explicit SELinux context |
+| Create one directory | `mkdir DIR` | Errors if parent missing |
+| Create chain | `mkdir -p A/B/C` | Idempotent |
+| Create with explicit mode | `mkdir -m 0750 DIR` | Bypasses umask |
+| Chain with explicit mode | `mkdir -p -m 0750 A/B/C` | Mode applies to ALL created directories |
+| Verbose | `mkdir -pv A/B/C` | Print each created |
+| With SELinux context | `mkdir -Z DIR` | Inherits per-policy default |
+| Specific context | `mkdir --context='system_u:object_r:tmp_t:s0' DIR` | Less common; usually let `restorecon` fix later |
+| Brace expansion fan-out | `mkdir -p /data/{web,api,db}/{logs,configs}` | Creates 3×2 = 6 leaves |
+| With install (Makefile-friendly) | `install -d -m 0755 -o root -g wheel /opt/app` | Mode + owner + group in one |
+| Followed by chown | `mkdir -p DIR && chown -R user:group DIR` | Separate ownership step |
+
+> **Rule one of `mkdir`:** Always use `-p` in scripts. The idempotence is free and saves you from re-run errors.
 
 ---
 
-## 🛣️ RHCA Pathway Sidebar
+## 🎯 Career Pathway Sidebar
 
-| Cert level | Why this lab matters |
+| Level | Why this lab matters |
 |---|---|
-| **RHCSA EX200** | Task 8 (create directory with specific mode/owner), every "create the path X" prerequisite |
-| **RHCE EX294** | `ansible.builtin.file: state: directory` mirrors `mkdir -p` semantics |
-| **CKA** | Rebuilding `/etc/kubernetes/pki/etcd`, `/var/lib/kubelet/pods`, `/etc/cni/net.d` |
-| **RHCA — RH342 (Troubleshooting)** | Recovery — recreate service directories with correct mode/owner/context |
-| **RHCA — RH358 (Services)** | Each service has a tree under `/etc/<svc>/conf.d` and `/var/lib/<svc>` |
-| **RHCA — RH236 (Gluster)** | Brick paths under `/data/gluster/brickN/` need `mkdir -p` + relabel |
+| **RHCSA candidate** | "Create the directory tree X/Y/Z with mode N" tasks are common. `mkdir -p -m` solves them. |
+| **RHCE candidate** | Ansible `file: state=directory  recurse: yes  mode: '0750'` mirrors `mkdir -p -m`. |
+| **SRE / Platform** | Bootstrap scripts for new hosts run `mkdir -p` everywhere — `/var/log/myapp`, `/opt/myapp`, `/srv/data`. |
+| **DevOps** | Dockerfile `RUN mkdir -p /app/{cache,uploads,logs}` is the per-build tree provisioning. |
+| **AI / MLOps** | `mkdir -p runs/$(date +%Y)/$(date +%m)/$(date +%d)/exp-$N` standardizes the experiment-output layout. |
 
 ---
 
-## 🔧 The 20 Tasks
+## 🔧 The 6 Tasks
 
-> Each task ends with three callouts: **Switches** (every flag), **Output decoded** (what each line means), and **Troubleshoot** (what to do if it goes wrong).
+> Six exam-realistic phases that build the **plan → mkdir -p → verify** habit.
 
 ---
 
-### Task 1 — Set up the lab workspace
+### Task 1 — Create one directory at a time
 
-**Purpose:** A clean root so each subsequent step starts predictable.
+**Purpose:** Set up the sandbox and use bare `mkdir` to create directories, observing the "parent must exist" rule.
 
 ```bash
-mkdir -p ~/mkdir-lab
-cd ~/mkdir-lab
-pwd
+mkdir -p /tmp/mk-lab && cd /tmp/mk-lab
+
+mkdir single
+ls -ld single
+
+mkdir alpha bravo charlie
+ls -ld alpha bravo charlie
+
+mkdir deep/nested/path 2>&1 | head -n 1
+ls -ld deep 2>&1 | head -n 1
 ```
+
+**Human-Readable Breakdown:** Make the sandbox, create one directory, then three directories in a single command, then try to create a deep path without `-p` and watch it fail.
+
+**Reading it left to right:** `mkdir DIR` succeeds when the parent exists and the target does not. Multiple-name `mkdir` is just multiple syscalls in one command. Without `-p`, the kernel returns `ENOENT` because the parent is missing.
+
+**The story:** This is the experiment that motivates `-p`. Once you have seen "No such file or directory" on a missing parent, you reach for `-p` every time.
 
 **Expected output:**
 
-```
-/home/ec2-user/mkdir-lab
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mkdir -p` | Create parents; ignore "already exists" |
-| `cd` | Change to the new dir |
-| `pwd` | Confirm |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `/home/ec2-user/mkdir-lab` | Workspace ready |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `Permission denied` | Use a path inside your home |
-
----
-
-### Task 2 — `mkdir` basic — single directory
-
-**Purpose:** The simplest case. Single existing parent, single new child.
-
-```bash
-mkdir simple
-ls -ld simple
-```
-
-**Expected output:**
-
-```
-drwxr-xr-x. 2 ec2-user ec2-user 6 Sep 12 16:00 simple
+```text
+drwxr-xr-x. 2 user user 6 May 26 14:50 single
+drwxr-xr-x. 2 user user 6 May 26 14:50 alpha
+drwxr-xr-x. 2 user user 6 May 26 14:50 bravo
+drwxr-xr-x. 2 user user 6 May 26 14:50 charlie
+mkdir: cannot create directory 'deep/nested/path': No such file or directory
+ls: cannot access 'deep': No such file or directory
 ```
 
 **Switches**
@@ -136,636 +180,212 @@ drwxr-xr-x. 2 ec2-user ec2-user 6 Sep 12 16:00 simple
 | Token | Meaning |
 |---|---|
 | `mkdir DIR` | Create one directory |
-| `ls -ld DIR` | Show the directory itself, not its contents |
-
-**Output decoded**
-
-| Column | Value | Meaning |
-|---|---|---|
-| Type+perms | `drwxr-xr-x.` | Directory, owner full, group r-x, other r-x |
-| Links | `2` | Self (`.`) plus name in parent |
-| Owner/Group | `ec2-user ec2-user` | Defaults to your identity |
-| Size | `6` | Directory metadata size (not contents) |
-| Time | `Sep 12 16:00` | Created just now |
+| `mkdir A B C` | Multiple siblings |
+| `ls -ld DIR` | List directory itself, not contents |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Permissions are 0700 instead of 0755 | Your `umask` is `0077` — run `umask 0022` and recreate |
+| `File exists` | Directory already exists — use `-p` to ignore |
+| `Permission denied` | No write on parent — `sudo` or pick another path |
+| `No such file or directory` | Missing parent — use `-p` |
 
 ---
 
-### Task 3 — `mkdir` multiple at once
+### Task 2 — `mkdir -p` for deep trees
 
-**Purpose:** Pass multiple names to create them in parallel.
+**Purpose:** Use `-p` to create any chain of missing parents in one command, and confirm idempotence by re-running.
 
 ```bash
-mkdir alpha beta gamma
-ls -d alpha beta gamma
+cd /tmp/mk-lab
+
+mkdir -p deep/nested/path
+ls -lR deep
+
+# Idempotent — re-run is a no-op
+mkdir -p deep/nested/path
+ls -lR deep
+echo "exit=$?"
+
+# Mixed — some segments exist, some don't
+mkdir -p deep/nested/another/branch
+ls -lR deep
 ```
+
+**Human-Readable Breakdown:** Create a three-level deep path in one command. Run the same command again — no error, no change. Then add a new branch to the existing tree.
+
+**Reading it left to right:** `-p` makes `mkdir` walk each segment of the path, creating it if missing and skipping if present. The exit code is `0` whether all segments existed before or not.
+
+**The story:** Once you see `mkdir -p` succeed twice in a row without error, you understand why every Ansible playbook and every CI script uses it. Idempotence is a superpower.
 
 **Expected output:**
 
-```
-alpha  beta  gamma
+```text
+deep:
+total 0
+drwxr-xr-x. 3 user user 21 May 26 14:51 nested
+
+deep/nested:
+total 0
+drwxr-xr-x. 2 user user 6 May 26 14:51 path
+
+deep/nested/path:
+total 0
+
+(same output again)
+exit=0
+
+deep:
+total 0
+drwxr-xr-x. 3 user user 39 May 26 14:51 nested
+
+deep/nested:
+total 0
+drwxr-xr-x. 2 user user 6 May 26 14:51 another
+drwxr-xr-x. 2 user user 6 May 26 14:51 path
+
+deep/nested/another:
+total 0
+drwxr-xr-x. 2 user user 6 May 26 14:51 branch
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mkdir a b c` | Three separate top-level directories |
-| `ls -d` | List the directory entries, not their contents |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| All three names | Created in one syscall sequence |
+| `-p` | Create missing parents; no error if target exists |
+| `ls -lR PATH` | Long recursive listing |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `mkdir: cannot create directory ‘beta’: File exists` | One of them already exists — add `-p` or remove first |
+| Still got `No such file or directory` | Typo in `-p` (looks like `-P`) — both work; check whitespace |
+| Permissions wrong on intermediate dirs | `-p` does NOT apply `-m` to existing parents — `chmod` after if needed |
+| Exit code non-zero | A real error (permissions, read-only FS) — read the message |
 
 ---
 
-### Task 4 — Plain `mkdir` fails on nested paths
+### Task 3 — Explicit mode with `-m`
 
-**Purpose:** Show why `-p` exists. Without it, `mkdir a/b/c` fails if `a/b` is missing.
+**Purpose:** Use `-m MODE` to set the mode on creation, bypassing umask, and observe how it interacts with `-p`.
 
 ```bash
-mkdir a/b/c 2>&1
+cd /tmp/mk-lab
+umask
+echo "default umask above"
+
+mkdir default-dir
+ls -ld default-dir
+
+mkdir -m 0700 private-dir
+ls -ld private-dir
+
+mkdir -p -m 0750 chain/level1/level2
+ls -ld chain chain/level1 chain/level1/level2
+
+# Note: -m only applies to NEWLY created dirs
+ls -ld chain
+mkdir -p -m 0700 chain/level1/already-there/leaf
+ls -ld chain chain/level1 chain/level1/already-there chain/level1/already-there/leaf
 ```
+
+**Human-Readable Breakdown:** Inspect default umask. Create a directory with default mode (umask-derived), then with explicit `-m 0700`. Use `-p -m 0750` to apply mode to a whole new chain. Finally, demonstrate that `-m` does NOT change existing intermediate directories.
+
+**Reading it left to right:** Default `mkdir` uses `0777 & ~umask` for mode. `-m MODE` overrides that. With `-p -m`, every **newly created** segment gets MODE; existing segments are unchanged.
+
+**The story:** Forgetting `-m` and relying on umask is the source of "the directory is mode 775 when I wanted 750" bugs. Always set `-m` explicitly when the prompt cares about permissions.
 
 **Expected output:**
 
-```
-mkdir: cannot create directory 'a/b/c': No such file or directory
+```text
+0022
+default umask above
+drwxr-xr-x. 2 user user 6 May 26 14:53 default-dir
+drwx------. 2 user user 6 May 26 14:53 private-dir
+drwxr-x---. 3 user user 21 May 26 14:53 chain
+drwxr-x---. 3 user user 21 May 26 14:53 chain/level1
+drwxr-x---. 2 user user 6 May 26 14:53 chain/level1/level2
+drwxr-x---. 3 user user 21 May 26 14:53 chain
+drwx------. 3 user user 21 May 26 14:53 chain/level1/already-there
+drwx------. 2 user user 6 May 26 14:53 chain/level1/already-there/leaf
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `mkdir a/b/c` | Tries to create `c` in `a/b`; refuses because `a/b` doesn't exist |
-| `2>&1` | Combine stderr so we see the error |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `No such file or directory` | Parent path is missing |
+| `-m 0750` | Set mode at creation (0750 = rwxr-x---) |
+| `umask` | Show or set the default mode mask |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Wanted to create the whole tree | Use `-p` (Task 5) |
+| Mode is `0775` instead of `0750` | Forgot `-m`; umask was 0022 |
+| Existing parent has wrong mode | `-m` does not retroactively chmod — use `chmod` separately |
+| Permission denied creating a leaf | Intermediate dir mode does not allow execute — re-set with chmod |
 
 ---
 
-### Task 5 — `mkdir -p` builds the whole chain
+### Task 4 — Brace expansion fan-out
 
-**Purpose:** The headline feature.
+**Purpose:** Use bash brace expansion `{a,b,c}` to create many sibling directories in one command, and combine with `-p` for multi-level fan-outs.
 
 ```bash
-mkdir -p a/b/c/d/e
-ls -R a
+cd /tmp/mk-lab
+
+mkdir -p projects/{web,api,db}
+ls projects/
+
+mkdir -p projects/{web,api,db}/{logs,configs,backups}
+find projects -type d
+
+# Year/month/day pattern
+mkdir -p runs/2026/{01..12}/{01..31}
+find runs -type d | head -n 20
+
+# Cartesian product
+mkdir -p envs/{dev,stage,prod}/{us-east,us-west,eu-west}
+find envs -type d
 ```
+
+**Human-Readable Breakdown:** Fan out three siblings under `projects/`, then three sub-siblings inside each (9 leaves), then a year/month/day fixture (12*31 = 372 leaves under runs/2026), then a 3×3 environment matrix.
+
+**Reading it left to right:** `{a,b,c}` is bash brace expansion — the shell expands it into all combinations **before** `mkdir` runs. `{01..12}` is a sequence (compact form). Combining expansions multiplies — `{web,api,db}/{logs,configs}` produces 6 paths.
+
+**The story:** Brace expansion turns long shell loops into one-liners. Once you have set up a year/month/day directory tree with one command, you stop writing for-loops for fixture creation.
 
 **Expected output:**
 
-```
-a:
-b
-
-a/b:
-c
-
-a/b/c:
-d
-
-a/b/c/d:
-e
-
-a/b/c/d/e:
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-p` | Create missing parents; never error on existing |
-
-**Output decoded**
-
-| Each block | One level of the chain; final `e` is empty |
-
-**Why a sysadmin needs this:** RHCSA Task 8 commonly says "create `/srv/web/sites/example.com/htdocs`" — a single `mkdir -p` handles it.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Strange permissions mid-chain | Use `-m` (Task 9) to set them explicitly |
-
----
-
-### Task 6 — Idempotent: `mkdir -p` on existing dir is a no-op
-
-**Purpose:** Prove that running `mkdir -p` twice never errors. This is what makes it safe for scripts.
-
-```bash
-mkdir -p ~/mkdir-lab/already
-mkdir -p ~/mkdir-lab/already
-echo "exit code = $?"
-```
-
-**Expected output:**
-
-```
-exit code = 0
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `-p` | Suppress "already exists" errors |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `exit code = 0` | Success even on the second run |
-
-**Why on RHCE EX294:** Ansible's `file: state=directory` is idempotent for the same reason — internally it acts like `mkdir -p`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Exit code 1 on second run | You forgot `-p` — re-run with it |
-
----
-
-### Task 7 — Brace expansion to make many at once
-
-**Purpose:** Combine `mkdir -p` with brace expansion for complex trees in one line.
-
-```bash
-mkdir -p ~/mkdir-lab/web/{logs,configs,htdocs/{en,es,fr},backup/{daily,weekly}}
-find ~/mkdir-lab/web -type d | sort
-```
-
-**Expected output:**
-
-```
-/home/ec2-user/mkdir-lab/web
-/home/ec2-user/mkdir-lab/web/backup
-/home/ec2-user/mkdir-lab/web/backup/daily
-/home/ec2-user/mkdir-lab/web/backup/weekly
-/home/ec2-user/mkdir-lab/web/configs
-/home/ec2-user/mkdir-lab/web/htdocs
-/home/ec2-user/mkdir-lab/web/htdocs/en
-/home/ec2-user/mkdir-lab/web/htdocs/es
-/home/ec2-user/mkdir-lab/web/htdocs/fr
-/home/ec2-user/mkdir-lab/web/logs
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `{a,b,c}` | Comma brace expansion |
-| `{a/{x,y},b}` | Nested brace expansion (cartesian product) |
-| `find ... -type d` | List directories only |
-
-**Output decoded**
-
-| Each line | A subdirectory the shell expanded and `mkdir -p` created |
-
-**Why a sysadmin needs this on RHCE EX294:** Ansible role scaffolding — `roles/myapp/{tasks,handlers,templates,files,vars,defaults,meta}` in one command.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Shell made one literal directory named `{a,b,c}` | You're in `sh` not `bash` — switch shells |
-
----
-
-### Task 8 — Verbose with `-v`
-
-**Purpose:** See what `mkdir -p` actually created (useful when chains are deep).
-
-```bash
-mkdir -pv ~/mkdir-lab/v/i/s/i/b/l/e
-```
-
-**Expected output:**
-
-```
-mkdir: created directory '/home/ec2-user/mkdir-lab/v'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i/s'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i/s/i'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i/s/i/b'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i/s/i/b/l'
-mkdir: created directory '/home/ec2-user/mkdir-lab/v/i/s/i/b/l/e'
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-v` | Verbose — print one line per directory actually created |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| `created directory '...'` | A new directory at that depth |
-| (no line for existing dirs) | `-v` only mentions NEW creations |
-
-**Why on RHCA RH342:** During recovery, `-v` proves which segments you actually fixed.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| No output at all | Every segment already existed — that's success, not failure |
-
----
-
-### Task 9 — Set mode at creation with `-m`
-
-**Purpose:** Avoid a separate `chmod` by setting mode at creation.
-
-```bash
-mkdir -m 0750 ~/mkdir-lab/secret
-ls -ld ~/mkdir-lab/secret
-mkdir -m 0700 -p ~/mkdir-lab/keys/private/v1
-ls -ld ~/mkdir-lab/keys ~/mkdir-lab/keys/private ~/mkdir-lab/keys/private/v1
-```
-
-**Expected output:**
-
-```
-drwxr-x---. 2 ec2-user ec2-user 6 Sep 12 16:10 /home/ec2-user/mkdir-lab/secret
-drwxr-xr-x. 3 ec2-user ec2-user 21 Sep 12 16:10 /home/ec2-user/mkdir-lab/keys
-drwxr-xr-x. 3 ec2-user ec2-user 17 Sep 12 16:10 /home/ec2-user/mkdir-lab/keys/private
-drwx------. 2 ec2-user ec2-user  6 Sep 12 16:10 /home/ec2-user/mkdir-lab/keys/private/v1
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-m MODE` | Set permission mode at creation |
-| `0750` | Owner rwx, group r-x, other none |
-| `0700` | Owner rwx only |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `drwxr-x---.` | Mode 0750 — task explicit |
-| Intermediate `keys` and `keys/private` showing `0755` | `-m` applies only to the **final** directory created |
-| Final `v1` at `drwx------.` (0700) | Got the requested mode |
-
-> **Gotcha:** With `-p`, intermediate directories use the default mode (`0777 & ~umask`), NOT the `-m` mode. If you need every level at 0700, use a loop:
-> ```bash
-> for d in keys keys/private keys/private/v1; do mkdir -m 0700 -p "$d"; done
-> ```
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Wrong mode on intermediates | Set them manually with `chmod -R 0700 keys` or use the loop pattern above |
-
----
-
-### Task 10 — Set SELinux context with `-Z`
-
-**Purpose:** Create with the policy-defined context — no separate `restorecon` needed.
-
-```bash
-sudo mkdir -p -Z /var/www/html/site2
-sudo ls -lZd /var/www/html /var/www/html/site2
-```
-
-**Expected output:**
-
-```
-drwxr-xr-x. 3 root root system_u:object_r:httpd_sys_content_t:s0 19 Sep 12 16:15 /var/www/html
-drwxr-xr-x. 2 root root system_u:object_r:httpd_sys_content_t:s0  6 Sep 12 16:15 /var/www/html/site2
-```
-
-**Switches**
-
-| Flag | Meaning |
-|---|---|
-| `-Z` | Set SELinux context (no value → use the system default for the path) |
-| `--context=CTX` | Explicit context |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `httpd_sys_content_t` | Inherited from parent / policy — what Apache needs |
-
-**Why a sysadmin needs this on RHCSA Task 16:** Avoids the `restorecon` follow-up step — context is correct from creation.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `mkdir: unrecognized option -- 'Z'` | Old coreutils — fall back to `mkdir` + `restorecon -Rv` |
-
----
-
-### Task 11 — Create + chown + chmod pattern
-
-**Purpose:** Most exam tasks require all three. Know the canonical 3-line incantation.
-
-```bash
-sudo mkdir -p /srv/admin/reports
-sudo chown root:wheel /srv/admin/reports 2>/dev/null || sudo chown root:root /srv/admin/reports
-sudo chmod 0750 /srv/admin/reports
-ls -ldZ /srv/admin/reports
-```
-
-**Expected output:**
-
-```
-drwxr-x---. 2 root root unconfined_u:object_r:var_t:s0 6 Sep 12 16:20 /srv/admin/reports
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `mkdir -p` | Create dir tree |
-| `chown user:group` | Set owner+group |
-| `chmod MODE` | Set permissions |
-| `ls -ldZ` | Verify in one line (directory itself + context) |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `drwxr-x---.` | Mode 0750 |
-| `root root` | Owner+group as set |
-| `var_t` | Default context for `/srv` — may need `restorecon` or `semanage fcontext` depending on task |
-
-**Why on RHCSA Task 8:** Single most common exam task. Memorize the 4-line pattern (mkdir, chown, chmod, ls -ldZ).
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `chown: invalid group: 'wheel'` | Wheel group may not exist on your distro — substitute `root` or the correct group |
-
----
-
-### Task 12 — Absolute vs relative paths
-
-**Purpose:** Both work. Pick the right one for the situation.
-
-```bash
-cd ~/mkdir-lab
-mkdir -pv ./relative/deep/dir
-mkdir -pv /tmp/absolute/$USER/deep/dir
-ls -d ./relative/deep/dir /tmp/absolute/$USER/deep/dir
-```
-
-**Expected output:**
-
-```
-mkdir: created directory './relative'
-mkdir: created directory './relative/deep'
-mkdir: created directory './relative/deep/dir'
-mkdir: created directory '/tmp/absolute/ec2-user'
-mkdir: created directory '/tmp/absolute/ec2-user/deep'
-mkdir: created directory '/tmp/absolute/ec2-user/deep/dir'
-./relative/deep/dir  /tmp/absolute/ec2-user/deep/dir
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `./relative/...` | Relative — depends on current dir |
-| `/tmp/absolute/...` | Absolute — works from anywhere |
-| `$USER` | Environment variable for your username |
-
-**Output decoded**
-
-| Phase | Where the directory landed |
-|---|---|
-| Relative | Under `~/mkdir-lab/` (because that's `pwd`) |
-| Absolute | Under `/tmp/` (regardless of `pwd`) |
-
-**Why a sysadmin needs this:** Scripts run from any working directory — always use absolute paths in `mkdir -p`.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Created in the wrong place | `pwd` first, or always use absolute paths in scripts |
-
----
-
-### Task 13 — `install -d` as an alternative
-
-**Purpose:** When you need to set mode AND owner AND group in one shot (the `install` command).
-
-```bash
-sudo install -d -m 0750 -o root -g root /srv/installed
-ls -ld /srv/installed
-```
-
-**Expected output:**
-
-```
-drwxr-x---. 2 root root 6 Sep 12 16:25 /srv/installed
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `install -d DIR` | Create directory (the `d` flag means "directory mode") |
-| `-m MODE` | Permission mode |
-| `-o USER` | Owner |
-| `-g GROUP` | Group |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `drwxr-x---.` | Mode 0750 set in one command |
-| Owner+group = root | Set explicitly |
-
-> `install -d` replaces `mkdir -p` + `chmod` + `chown` for repetitive tasks. It's not in every distro by default but is standard on RHEL/CentOS/Rocky/Alma via coreutils.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `install: invalid option -- 'd'` | Use the three-step pattern from Task 11 instead |
-
----
-
-### Task 14 — Detect what `mkdir -p` actually created
-
-**Purpose:** Use `touch /tmp/mark` + `find -newer` from Lab 07 to audit.
-
-```bash
-touch /tmp/before-mark
-mkdir -pv ~/mkdir-lab/audit/{logs,configs}/{prod,dev}
-find ~/mkdir-lab/audit -newer /tmp/before-mark -type d
-```
-
-**Expected output:**
-
-```
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/logs'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/logs/prod'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/logs/dev'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/configs'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/configs/prod'
-mkdir: created directory '/home/ec2-user/mkdir-lab/audit/configs/dev'
-/home/ec2-user/mkdir-lab/audit
-/home/ec2-user/mkdir-lab/audit/logs
-/home/ec2-user/mkdir-lab/audit/logs/prod
-/home/ec2-user/mkdir-lab/audit/logs/dev
-/home/ec2-user/mkdir-lab/audit/configs
-/home/ec2-user/mkdir-lab/audit/configs/prod
-/home/ec2-user/mkdir-lab/audit/configs/dev
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `touch /tmp/before-mark` | Sentinel file with current timestamp |
-| `find -newer FILE` | Find entries newer than FILE (Lab 14) |
-| `-type d` | Directories only |
-
-**Output decoded**
-
-| Block | Meaning |
-|---|---|
-| `mkdir: created ...` lines | What `-v` told us |
-| `find` listing | Independent verification |
-
-**Why on RHCA RH342:** During recovery, prove which directories your scripts actually touched.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `find` returns nothing | Sentinel was AFTER the `mkdir` — re-run with sentinel first |
-
----
-
-### Task 15 — `mkdir -p` for kubelet/etcd paths (CKA)
-
-**Purpose:** Recreate the canonical Kubernetes control-plane directories after a reset.
-
-```bash
-sudo mkdir -pv -m 0700 /etc/kubernetes/pki/etcd
-sudo mkdir -pv -m 0755 /var/lib/kubelet/pods
-sudo mkdir -pv -m 0700 /var/lib/etcd
-sudo mkdir -pv -m 0755 /etc/cni/net.d
-
-sudo ls -ld /etc/kubernetes/pki/etcd /var/lib/kubelet /var/lib/etcd /etc/cni/net.d
-```
-
-**Expected output (excerpt):**
-
-```
-mkdir: created directory '/etc/kubernetes'
-mkdir: created directory '/etc/kubernetes/pki'
-mkdir: created directory '/etc/kubernetes/pki/etcd'
-mkdir: created directory '/var/lib/kubelet'
-mkdir: created directory '/var/lib/kubelet/pods'
-mkdir: created directory '/var/lib/etcd'
-mkdir: created directory '/etc/cni'
-mkdir: created directory '/etc/cni/net.d'
-drwx------. 2 root root  6 Sep 12 16:30 /etc/kubernetes/pki/etcd
-drwxr-xr-x. 3 root root 17 Sep 12 16:30 /var/lib/kubelet
-drwx------. 2 root root  6 Sep 12 16:30 /var/lib/etcd
-drwxr-xr-x. 2 root root  6 Sep 12 16:30 /etc/cni/net.d
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `-p` | Build the whole chain |
-| `-v` | Show what was created |
-| `-m 0700` | Owner-only access for sensitive paths (PKI, etcd) |
-| `-m 0755` | World-readable for paths the kubelet shares with CNI |
-
-**Output decoded**
-
-| Path | Mode | Used for |
-|---|---|---|
-| `/etc/kubernetes/pki/etcd` | 0700 | etcd member certificates — secrets |
-| `/var/lib/kubelet/pods` | 0755 | Kubelet's pod state |
-| `/var/lib/etcd` | 0700 | etcd data — strictly private |
-| `/etc/cni/net.d` | 0755 | CNI config — readable by kubelet |
-
-**Why on CKA:** Kubelet pre-flight checks fail if these directories are missing — recovery starts here.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Kubelet still failing | Check ownership too — most should be `root:root` |
-
----
-
-### Task 16 — Idempotent `mkdir -p` in shell scripts
-
-**Purpose:** The pattern every production script uses.
-
-```bash
-cat > ~/mkdir-lab/setup.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-
-BASE="${BASE:-/srv/myapp}"
-DIRS=( logs configs backup/daily backup/weekly )
-
-for d in "${DIRS[@]}"; do
-  mkdir -pv -m 0750 "$BASE/$d"
-done
-
-ls -ld "$BASE" "${DIRS[@]/#/$BASE/}"
-EOF
-chmod +x ~/mkdir-lab/setup.sh
-BASE=~/mkdir-lab/app1 ~/mkdir-lab/setup.sh
-```
-
-**Expected output (excerpt):**
-
-```
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1'
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1/logs'
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1/configs'
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1/backup'
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1/backup/daily'
-mkdir: created directory '/home/ec2-user/mkdir-lab/app1/backup/weekly'
-drwxr-x---. 5 ec2-user ec2-user ... /home/ec2-user/mkdir-lab/app1
+```text
+api  db  web
+projects
+projects/api
+projects/api/backups
+projects/api/configs
+projects/api/logs
+projects/db
+projects/db/backups
+projects/db/configs
+projects/db/logs
+projects/web
+projects/web/backups
+projects/web/configs
+projects/web/logs
+runs
+runs/2026
+runs/2026/01
+runs/2026/01/01
+runs/2026/01/02
+...
+envs
+envs/dev
+envs/dev/eu-west
+envs/dev/us-east
+envs/dev/us-west
+envs/prod
 ...
 ```
 
@@ -773,284 +393,203 @@ drwxr-x---. 5 ec2-user ec2-user ... /home/ec2-user/mkdir-lab/app1
 
 | Token | Meaning |
 |---|---|
-| `set -euo pipefail` | Strict-mode bash: exit on error, undefined vars, pipe failures |
-| `${BASE:-/srv/myapp}` | Default value if `BASE` unset |
-| `DIRS=( ... )` | Array of subdirectories |
-| `${DIRS[@]/#/$BASE/}` | Expand each element with `$BASE/` prefix |
-
-**Output decoded**
-
-| Line | Meaning |
-|---|---|
-| Each `created directory` | One subdirectory built |
-| Final `ls -ld` rows | Verification |
-
-**Why a sysadmin needs this on RHCE EX294:** This is the bash equivalent of `ansible.builtin.file: state=directory` with a loop — recognize the pattern in both worlds.
+| `{a,b,c}` | Brace expansion — comma-separated list |
+| `{01..12}` | Numeric sequence (compact form) |
+| `find DIR -type d` | List all directories recursively |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `unbound variable` | `set -u` is strict — make sure all variables are initialized |
+| Brace expansion not happening | Used quotes — `'{a,b,c}'` is literal; remove quotes around braces |
+| Path created literally with braces | Running `sh` instead of `bash` — switch shells |
+| Too many directories created | Multiply: N × M segments; double-check product before running |
 
 ---
 
-### Task 17 — Ansible role scaffolding pattern
+### Task 5 — Verbose `-v` and SELinux `-Z`
 
-**Purpose:** Create the standard Ansible role layout in one line.
+**Purpose:** Use `-v` for an audit trail of created directories, and `-Z` to set SELinux context at creation (or rely on policy inheritance).
 
 ```bash
-ROLE=~/mkdir-lab/roles/myapp
-mkdir -pv "$ROLE"/{tasks,handlers,templates,files,vars,defaults,meta}
-find "$ROLE" -type d | sort
+cd /tmp/mk-lab
+
+mkdir -pv audit/{2026/{Q1,Q2,Q3,Q4},archive}
+ls -lZd audit audit/2026 audit/2026/Q1
+
+# -Z with no argument inherits the per-policy default
+mkdir -Z secure-tmp
+ls -ldZ secure-tmp
+
+# Explicit context (rare; usually wrong unless policy says so)
+mkdir --context='unconfined_u:object_r:user_tmp_t:s0' explicit-ctx
+ls -ldZ explicit-ctx
 ```
+
+**Human-Readable Breakdown:** Create an audit tree with `-pv` for a verbose log. Then create directories with `-Z` (policy default) and `--context=` (explicit).
+
+**Reading it left to right:** `-v` prints `mkdir: created directory '...'` for each segment. `-Z` (with no argument) lets the kernel apply policy-derived contexts. Explicit `--context=` overrides — useful for fixing wrong defaults during fixture creation.
+
+**The story:** Logging is invaluable in scripts that bootstrap a system from scratch. `-v` makes that audit trail free.
 
 **Expected output:**
 
-```
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/tasks'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/handlers'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/templates'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/files'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/vars'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/defaults'
-mkdir: created directory '/home/ec2-user/mkdir-lab/roles/myapp/meta'
-/home/ec2-user/mkdir-lab/roles/myapp
-/home/ec2-user/mkdir-lab/roles/myapp/defaults
-/home/ec2-user/mkdir-lab/roles/myapp/files
-/home/ec2-user/mkdir-lab/roles/myapp/handlers
-/home/ec2-user/mkdir-lab/roles/myapp/meta
-/home/ec2-user/mkdir-lab/roles/myapp/tasks
-/home/ec2-user/mkdir-lab/roles/myapp/templates
-/home/ec2-user/mkdir-lab/roles/myapp/vars
+```text
+mkdir: created directory 'audit'
+mkdir: created directory 'audit/2026'
+mkdir: created directory 'audit/2026/Q1'
+mkdir: created directory 'audit/2026/Q2'
+mkdir: created directory 'audit/2026/Q3'
+mkdir: created directory 'audit/2026/Q4'
+mkdir: created directory 'audit/archive'
+drwxr-xr-x. 4 user user unconfined_u:object_r:user_tmp_t:s0 30 May 26 14:55 audit
+drwxr-xr-x. 6 user user unconfined_u:object_r:user_tmp_t:s0 32 May 26 14:55 audit/2026
+drwxr-xr-x. 2 user user unconfined_u:object_r:user_tmp_t:s0  6 May 26 14:55 audit/2026/Q1
+drwxr-xr-x. 2 user user unconfined_u:object_r:user_tmp_t:s0  6 May 26 14:55 secure-tmp
+drwxr-xr-x. 2 user user unconfined_u:object_r:user_tmp_t:s0  6 May 26 14:55 explicit-ctx
 ```
 
 **Switches**
 
 | Token | Meaning |
 |---|---|
-| `{tasks,handlers,...}` | Brace expansion → 7 subdirectories |
-| `find ... -type d \| sort` | Verify with sorted directory list |
-
-**Output decoded**
-
-| Path | Ansible purpose |
-|---|---|
-| `tasks/` | Main task list (`main.yml`) |
-| `handlers/` | Restart triggers |
-| `templates/` | Jinja2 templates |
-| `files/` | Static files for `copy` |
-| `vars/` | High-precedence variables |
-| `defaults/` | Low-precedence variables |
-| `meta/` | Role dependencies and metadata |
-
-**Why on RHCE EX294:** First step of every role — `ansible-galaxy init` does the same thing, but knowing the manual command means you can fix layout drift.
+| `-v` | Verbose — print each creation |
+| `-Z` | SELinux context (policy default) |
+| `--context=CTX` | Explicit context |
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| `ansible-galaxy` not installed | Manual `mkdir -p` works just as well |
+| `-Z` not recognized | Old coreutils — upgrade or use `chcon` after |
+| Wrong context inherited | Use `restorecon -v PATH` after to apply policy defaults |
+| Explicit context error | Verify with `semanage fcontext -l` what is allowed |
 
 ---
 
-### Task 18 — `mkdir -p` with explicit SELinux context
+### Task 6 — Capstone: RHCSA-realistic deep-tree provisioning
 
-**Purpose:** Force a specific context, not just the policy default.
+**Task statement:** *"Create the directory tree `/data/projects/{web,api,db}/{logs,configs,backups}` in one command. Each leaf directory must be mode `0750` owned by `root:wheel`. Save a recursive listing to `/root/projects-tree.txt` and verify by checking the mode of one leaf."*
 
-```bash
-sudo mkdir -pv -Z --context=system_u:object_r:httpd_sys_content_t:s0 /srv/web-special
-sudo ls -ldZ /srv/web-special
-```
-
-**Expected output:**
-
-```
-mkdir: created directory '/srv/web-special'
-drwxr-xr-x. 2 root root system_u:object_r:httpd_sys_content_t:s0 6 Sep 12 16:40 /srv/web-special
-```
-
-**Switches**
-
-| Token | Meaning |
-|---|---|
-| `-Z` | Enable SELinux context setting |
-| `--context=CTX` | Use this explicit context |
-| `httpd_sys_content_t` | Apache content type |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `httpd_sys_content_t` | Now labeled for Apache — even though `/srv` would default to something else |
-
-**Why on RHCSA Task 16:** Sometimes the task says "create the directory with context X" — `-Z --context=` does it in one step.
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| Context not applied | Your kernel may lack the type — try `chcon -t TYPE` afterwards |
-
----
-
-### Task 19 — RHCSA-style scenario
-
-**Task statement:** *"Create `/srv/web/sites/intranet/htdocs` and `/srv/web/sites/intranet/logs`, both owned by `apache:apache`, mode `0750`. Verify."*
+**Purpose:** Execute a deep-tree provisioning end-to-end with correct mode and ownership.
 
 ```bash
-sudo useradd apache -m -r 2>/dev/null || true
-sudo groupadd -r apache 2>/dev/null || true
+sudo -i
+groupadd -f wheel 2>/dev/null || true
 
-sudo mkdir -pv -m 0750 /srv/web/sites/intranet/{htdocs,logs}
-sudo chown -R apache:apache /srv/web/sites/intranet
-sudo restorecon -Rv /srv/web
+rm -rf /data/projects
+mkdir -p -m 0750 /data/projects/{web,api,db}/{logs,configs,backups}
 
-ls -ldZ /srv/web/sites/intranet/htdocs /srv/web/sites/intranet/logs
-stat -c '%U %G %a %C %n' /srv/web/sites/intranet/htdocs /srv/web/sites/intranet/logs
+chown -R root:wheel /data/projects
+
+ls -lR /data/projects > /root/projects-tree.txt
+
+ls -ld /data/projects/web/logs
+stat -c '%n mode=%a owner=%U group=%G' /data/projects/web/logs
+
+# Verification
+test -d /data/projects/web/logs && echo "VERIFY: leaf directory exists"
+test "$(stat -c '%a' /data/projects/web/logs)" = "750" && echo "VERIFY: mode is 0750"
+test "$(stat -c '%U' /data/projects/web/logs)" = "root" && echo "VERIFY: owner is root"
+test "$(stat -c '%G' /data/projects/web/logs)" = "wheel" && echo "VERIFY: group is wheel"
+wc -l /root/projects-tree.txt
 ```
 
-**Expected output (excerpts):**
+**Human-Readable Breakdown:** Become root, ensure the `wheel` group exists, build a clean `/data/projects` tree with `mkdir -p -m 0750` (9 leaves), recursively chown to `root:wheel`, write the recursive listing to `/root/projects-tree.txt`, and run four `test`-based checks for mode/owner/group.
 
-```
-mkdir: created directory '/srv/web'
-mkdir: created directory '/srv/web/sites'
-mkdir: created directory '/srv/web/sites/intranet'
-mkdir: created directory '/srv/web/sites/intranet/htdocs'
-mkdir: created directory '/srv/web/sites/intranet/logs'
-drwxr-x---. 2 apache apache system_u:object_r:var_t:s0 6 Sep 12 16:45 /srv/web/sites/intranet/htdocs
-drwxr-x---. 2 apache apache system_u:object_r:var_t:s0 6 Sep 12 16:45 /srv/web/sites/intranet/logs
-apache apache 750 system_u:object_r:var_t:s0 /srv/web/sites/intranet/htdocs
-apache apache 750 system_u:object_r:var_t:s0 /srv/web/sites/intranet/logs
-```
+**Layer stack you built:**
 
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| `useradd/groupadd` | Ensure user/group exist |
-| `mkdir -pv -m 0750` | Create the full chain with correct mode for the leaves |
-| `chown -R` | Apply ownership to the entire intranet subtree |
-| `restorecon -Rv` | Recompute SELinux contexts from policy |
-| `ls -ldZ` + `stat -c` | One-line audit per directory |
-
-**Output decoded**
-
-| Token | Meaning |
-|---|---|
-| `apache apache` | Owner+group correct |
-| `750` | Mode correct |
-| `var_t` | SELinux type from policy for `/srv` |
-
-**Troubleshoot**
-
-| Symptom | Fix |
-|---|---|
-| `useradd` reports user exists | Fine — `\|\| true` suppresses the failure |
-| Intermediate `/srv/web` and `/srv/web/sites` have mode `0755` | Expected: `-m` only applies to leaves with `-p` |
-
----
-
-### Task 20 — CKA-style scenario
-
-**Task statement (CKA-flavored):** *"After a node reset, recreate `/etc/kubernetes/pki/etcd`, `/var/lib/kubelet/pods`, and `/var/lib/etcd` with correct permissions (700 for PKI/etcd, 755 for kubelet). Audit."*
-
-```bash
-sudo mkdir -pv -m 0700 /etc/kubernetes/pki/etcd /var/lib/etcd
-sudo mkdir -pv -m 0755 /var/lib/kubelet/pods
-
-stat -c '%a %U %G %C %n' /etc/kubernetes/pki/etcd /var/lib/etcd /var/lib/kubelet/pods
+```text
+/data/projects/                    mode=0750 root:wheel
+   ├── web/
+   │     ├── logs/
+   │     ├── configs/
+   │     └── backups/
+   ├── api/
+   │     ├── logs/
+   │     ├── configs/
+   │     └── backups/
+   └── db/
+         ├── logs/
+         ├── configs/
+         └── backups/
 ```
 
-**Expected output:**
+**The story:** This is the **canonical 30-second exam answer** for deep-tree provisioning. Memorize the spine: `mkdir -p -m MODE PARENT/{A,B,C}/{X,Y,Z}` → `chown -R USER:GROUP PARENT` → verify with `stat`.
 
+**Expected verification output:**
+
+```text
+drwxr-x---. 2 root wheel 6 May 26 14:57 /data/projects/web/logs
+/data/projects/web/logs mode=750 owner=root group=wheel
+VERIFY: leaf directory exists
+VERIFY: mode is 0750
+VERIFY: owner is root
+VERIFY: group is wheel
+26 /root/projects-tree.txt
 ```
-mkdir: created directory '/etc/kubernetes'
-mkdir: created directory '/etc/kubernetes/pki'
-mkdir: created directory '/etc/kubernetes/pki/etcd'
-mkdir: created directory '/var/lib/etcd'
-mkdir: created directory '/var/lib/kubelet'
-mkdir: created directory '/var/lib/kubelet/pods'
-700 root root system_u:object_r:cert_t:s0 /etc/kubernetes/pki/etcd
-700 root root system_u:object_r:var_lib_t:s0 /var/lib/etcd
-755 root root system_u:object_r:var_lib_t:s0 /var/lib/kubelet/pods
-```
-
-**Step-by-step rationale**
-
-| Step | Why |
-|---|---|
-| First `mkdir -pv -m 0700` | Sensitive PKI and etcd paths — owner-only |
-| Second `mkdir -pv -m 0755` | Kubelet shares with CNI/runtime — world-readable |
-| `stat -c` | One-line audit per path |
-
-**Output decoded**
-
-| Path | Mode | Why |
-|---|---|---|
-| `/etc/kubernetes/pki/etcd` | 700 | Stores etcd member certs — protect from other users |
-| `/var/lib/etcd` | 700 | Stores etcd database — strictly private |
-| `/var/lib/kubelet/pods` | 755 | Kubelet's pod state — needs to be traversable |
 
 **Cleanup**
 
 ```bash
-cd ~
-rm -rf ~/mkdir-lab
-rm -f /tmp/before-mark
-sudo rm -rf /srv/installed /srv/web /srv/web-special /var/www/html/site2 /tmp/absolute
-# Do NOT clean /etc/kubernetes or /var/lib/{etcd,kubelet} on a live node!
+rm -rf /tmp/mk-lab /data/projects /root/projects-tree.txt
+exit
 ```
 
 **Troubleshoot**
 
 | Symptom | Fix |
 |---|---|
-| Kubelet still complains about missing dir | Verify owner is `root:root`, mode matches expectations |
+| Leaves got mode 0700 instead of 0750 | umask was 0077 — explicit `-m 0750` overrides |
+| `wheel` group missing | `groupadd wheel` (RHEL has it by default) |
+| `chown -R` skipped some files | `-R` only affects files inside; not the args themselves — that's fine for dirs |
+| `Permission denied` writing report | Not root — `sudo -i` |
 
 ---
 
-## 🔍 `mkdir` Decision Guide
+## 🔍 mkdir Decision Guide
 
 ```
-Single dir, parents exist?           → mkdir <dir>
-Nested path?                         → mkdir -p <a/b/c>
-Idempotent in a script?              → mkdir -p (safe to re-run)
-Need specific mode?                  → mkdir -m MODE <dir>      (only last dir with -p)
-Need mode everywhere in the tree?    → loop:  for d in a a/b a/b/c; do mkdir -m M -p "$d"; done
-                                       OR    mkdir -p TREE && chmod -R M TREE
-Need owner+group too?                → mkdir + chown   OR   install -d -m M -o U -g G DIR
-Need SELinux context?                → mkdir -p -Z [--context=CTX] DIR
-Want to verify what got created?     → add -v
-Need many subdirs?                   → mkdir -p base/{a,b,c/{x,y},d}
+Need to create a directory?
+  │
+  ├── "One directory, parent exists"
+  │       └── ✅ mkdir DIR
+  │
+  ├── "Multi-level tree, parents may be missing"
+  │       └── ✅ mkdir -p A/B/C
+  │
+  ├── "Same as above, with explicit mode for ALL new segments"
+  │       └── ✅ mkdir -p -m 0750 A/B/C
+  │
+  ├── "Several siblings at once"
+  │       └── ✅ mkdir -p PARENT/{a,b,c}
+  │
+  ├── "Cartesian product of siblings"
+  │       └── ✅ mkdir -p PARENT/{a,b,c}/{x,y,z}
+  │
+  ├── "Year/month/day fixture"
+  │       └── ✅ mkdir -p runs/2026/{01..12}/{01..31}
+  │
+  ├── "Need a per-policy SELinux context"
+  │       └── ✅ mkdir -Z DIR        (or use `restorecon` after)
+  │
+  ├── "Need ownership too — Makefile-style"
+  │       └── ✅ install -d -m 0755 -o root -g wheel /opt/app
+  │
+  └── "Idempotent script line"
+          └── ✅ mkdir -p DIR        (always; never plain mkdir)
 ```
 
 ---
 
-## ✅ Lab Checklist (20 Tasks)
+## ✅ Lab Checklist (6 Tasks)
 
-- [ ] 01 Set up `~/mkdir-lab`
-- [ ] 02 `mkdir` a single directory
-- [ ] 03 `mkdir` multiple in one command
-- [ ] 04 Plain `mkdir a/b/c` fails on missing parents
-- [ ] 05 `mkdir -p a/b/c/d/e` builds the full chain
-- [ ] 06 `mkdir -p` is idempotent (no error on second run)
-- [ ] 07 Brace expansion with `-p` for complex trees
-- [ ] 08 `mkdir -pv` to see what was created
-- [ ] 09 `mkdir -m MODE` for permissions at creation
-- [ ] 10 `mkdir -p -Z` for SELinux context at creation
-- [ ] 11 Combine `mkdir + chown + chmod + ls -ldZ`
-- [ ] 12 Absolute vs relative paths
-- [ ] 13 `install -d -m -o -g` as alternative
-- [ ] 14 Audit creations with `find -newer`
-- [ ] 15 Recreate kubelet/etcd/PKI directories (CKA)
-- [ ] 16 Script-friendly idempotent loop
-- [ ] 17 Ansible role scaffolding in one command
-- [ ] 18 Explicit SELinux context with `--context=CTX`
-- [ ] 19 Exam: `/srv/web/sites/intranet/{htdocs,logs}` with mode 0750
-- [ ] 20 CKA: recreate `/etc/kubernetes/pki/etcd`, `/var/lib/etcd`, `/var/lib/kubelet/pods`
+- [ ] 01 Set up `/tmp/mk-lab` and create directories with plain `mkdir`
+- [ ] 02 Build a three-level tree with `mkdir -p` and verify idempotence
+- [ ] 03 Use `-m MODE` to bypass umask on creation
+- [ ] 04 Fan out trees with brace expansion `{a,b,c}/{x,y,z}` and `{01..31}`
+- [ ] 05 Use `-v` for audit, `-Z` for SELinux context
+- [ ] 06 Execute the RHCSA capstone — build `/data/projects/{web,api,db}/{logs,configs,backups}` mode 0750 owned root:wheel
 
 ---
 
@@ -1058,42 +597,35 @@ Need many subdirs?                   → mkdir -p base/{a,b,c/{x,y},d}
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Plain `mkdir` on nested path | `No such file or directory` | Add `-p` |
-| `mkdir -m MODE -p` and surprised intermediates are 0755 | `-m` only affects leaves | Loop or use `chmod -R` afterwards |
-| Forgetting `-p` in scripts | Second run errors | Always use `-p` for idempotency |
-| `mkdir /var/www/html/X` without `restorecon` | Apache may 403 on contents later | Use `mkdir -p -Z` or `restorecon -Rv` |
-| `mkdir -p .` or `..` | Confusing but harmless | Use real paths |
-| Brace expansion in `sh`/`dash` | Literal `{a,b}` directory created | Switch to bash |
-| Forgetting to `chown` after `sudo mkdir` | Files owned by root, your user can't write | Always `chown` to the service user |
+| Forgot `-p` in script | Errors on re-run | Always `-p` in scripts |
+| `-m` did not affect existing parent | mode unchanged on `/data` | `-m` applies only to newly created segments — use `chmod` for existing |
+| Brace expansion quoted | Literal `{a,b}` directory created | Remove quotes around braces |
+| Wanted parents with one mode and leaf with another | All segments get the same mode | Two `mkdir -p -m ...` calls |
+| Used `mkdir` instead of `install -d` in Makefile | No way to set owner | Use `install -d -m -o -g` |
+| Created tree without setting context | Files inherit wrong SELinux type | `restorecon -RFv /target/path` after |
+| Wrong umask | Mode is permissive (0775 instead of 0750) | Always `-m` when mode matters |
+| Tree under bind mount | Lost after umount | Verify mount points before |
+| Tried to `mkdir` over an existing file | `cannot create directory ...: File exists` | Remove the file or pick a different name |
+| Mass-created millions of dirs | Filesystem inode exhaustion possible | Check `df -i` before |
 
 ---
 
-## 📌 Exam Strategy
+## 🎯 Career & Interview Strategy
 
-**RHCSA EX200**
-- Task 8 patterns: `sudo mkdir -pv -m MODE PATH && sudo chown OWNER:GROUP PATH && ls -ldZ PATH`.
-- Use `install -d -m -o -g` when you remember it — saves three commands.
-- Always end with `ls -ldZ` (or `stat -c '%U %G %a %C %n'`) to verify all four attributes.
+**RHCSA candidate**
+- One-liner reflex: `mkdir -p -m MODE /path/{A,B,C}/{X,Y,Z}` then `chown -R user:group /path`. Practice until automatic.
 
-**RHCE EX294 (Ansible)**
-- `ansible.builtin.file: state=directory` parameters map directly to `mkdir -p` + `chown` + `chmod` + SELinux flags:
-  - `path:`, `state: directory`
-  - `mode:`, `owner:`, `group:`
-  - `setype:`, `seuser:`, `serole:`
-  - `recurse: yes` for nested
+**RHCE candidate**
+- Ansible: `file: state=directory  recurse: yes  mode: '0750'  owner: root  group: wheel  path: /data/projects/web/logs`.
 
-**CKA**
-- Memorize these paths and their modes:
-  - `/etc/kubernetes/pki/{,etcd}` → 0700
-  - `/var/lib/etcd` → 0700
-  - `/var/lib/kubelet/pods` → 0755
-  - `/etc/cni/net.d` → 0755
-- `sudo mkdir -p -m 0700` is the fastest recovery start.
+**SRE / Platform interview**
+- "How would you ensure a deep directory tree exists at host bootstrap?" → `mkdir -p` plus `chown -R` plus `restorecon -RFv` if SELinux context matters.
 
-**RHCA**
-- RH342: rebuild service trees during recovery — `mkdir -p` + `restorecon` + service restart.
-- RH358: every service has its own tree under `/etc/<svc>` and `/var/lib/<svc>`.
-- RH236: brick paths under `/data/gluster/brickN/` — `mkdir -p` + `restorecon`.
+**DevOps**
+- Dockerfiles use `RUN mkdir -p` to provision per-build directories; rebuilds reuse the same layer.
+
+**AI / MLOps**
+- `mkdir -p runs/$(date +%Y/%m/%d)/exp-$RUN_ID` standardizes output paths across experiments.
 
 ---
 
@@ -1101,16 +633,15 @@ Need many subdirs?                   → mkdir -p base/{a,b,c/{x,y},d}
 
 | Lab | Connection |
 |---|---|
-| Lab 05 — Navigation | `pwd` and `cd` after `mkdir -p` |
-| Lab 06 — `ls -lZ` | Verify mode, owner, group, context |
-| Lab 07 — `touch` | Often follows `mkdir -p` |
-| Lab 08 — `cp -a` | Deploy content into the new directory |
-| Lab 10 — `mv` | Move existing content into the new path |
-| Lab 11 — `rm`/`rmdir` | Symmetric cleanup operation |
+| Lab 05 — Directory Navigation | You navigate the trees `mkdir -p` builds |
+| Lab 06 — Listing & SELinux Contexts | Verifying contexts after `mkdir -Z` |
+| Lab 08 — Copying Files | Often paired: `mkdir -p DST && cp -a SRC DST/` |
+| Lab 11 — Safe Deletion | The undo for created trees |
+| Lab — Standard Permissions (`chmod`) *(later)* | The post-creation permission tweak |
 
 ---
 
 ## 👤 Author
 
-**Kelvin R. Tobias**  
+**Kelvin R. Tobias**
 [kelvinintech.com](https://kelvinintech.com) · [GitHub](https://github.com/kelvintechnical) · [LinkedIn](https://www.linkedin.com/in/kelvin-r-tobias-211949219)
